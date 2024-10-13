@@ -1,8 +1,19 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 import sqlite3
 import random
+from fastapi.middleware.cors import CORSMiddleware
+
+
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (for testing purposes, not recommended in production)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize variables
 total_shares = 100  # Total number of shares issued in the IPO
@@ -46,6 +57,25 @@ def init_db():
         )
     ''')
 
+    # Add buy and sell order tables
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS buy_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user TEXT,
+            price REAL,
+            num_shares INTEGER
+        )
+    ''')
+
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS sell_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user TEXT,
+            price REAL,
+            num_shares INTEGER
+        )
+    ''')
+
     # Initialize people with 0 shares and 1000 money
     people = [("Olin", 0, 1000), ("Mig", 0, 1000), ("Albert", 0, 1000)]
     cursor.executemany('INSERT OR IGNORE INTO people_to_shares (name, shares, money) VALUES (?, ?, ?)', people)
@@ -86,6 +116,16 @@ def get_balance_sheet():
     conn.close()
 
     return {"balance_sheet": balance_sheet}
+
+
+# API to get current share price and organization's money
+@app.get("/market_data")
+def get_market_data():
+    global cur_value, organization_money
+    return {
+        "current_share_price": cur_value,
+        "organization_money": organization_money
+    }
 
 
 # API to execute an IPO sale
@@ -135,9 +175,12 @@ def ipo_sale(buyer: str, num_shares: int):
     }
 
 
-# API for market maker to facilitate trades
 @app.post("/market_maker_trade")
-def market_maker_trade(buyer: str = None, seller: str = None, num_shares: int = 1):
+def market_maker_trade(
+    buyer: str = Query(None),
+    seller: str = Query(None),
+    num_shares: int = Query(1)
+):
     global cur_value
 
     conn = sqlite3.connect('market.db')
@@ -149,77 +192,90 @@ def market_maker_trade(buyer: str = None, seller: str = None, num_shares: int = 
     market_maker_inventory = market_maker_data[0]
     market_maker_cash = market_maker_data[1]
 
-    # Fetch buyer and seller data
+    # Define the spread
+    bid_price = cur_value * 0.95  # Seller sells at this price
+    ask_price = cur_value * 1.05  # Buyer buys at this price
+
+    if buyer and seller:
+        conn.close()
+        raise HTTPException(status_code=400, detail="Specify either buyer or seller, not both.")
+
     if buyer:
+        # Fetch buyer data
         cursor.execute('SELECT shares, money FROM people_to_shares WHERE name = ?', (buyer,))
         buyer_data = cursor.fetchone()
         if not buyer_data:
-            raise HTTPException(status_code=404, detail="Buyer not found")
+            conn.close()
+            raise HTTPException(status_code=404, detail="Buyer not found.")
 
-        buyer_shares = buyer_data[0]
-        buyer_money = buyer_data[1]
+        buyer_shares, buyer_money = buyer_data
 
-    if seller:
+        total_cost = num_shares * ask_price
+        if market_maker_inventory >= num_shares and buyer_money >= total_cost:
+            # Update buyer
+            buyer_shares += num_shares
+            buyer_money -= total_cost
+            cursor.execute('UPDATE people_to_shares SET shares = ?, money = ? WHERE name = ?', (buyer_shares, buyer_money, buyer))
+
+            # Update market maker
+            market_maker_inventory -= num_shares
+            market_maker_cash += total_cost
+            cursor.execute('UPDATE market_maker SET inventory = ?, cash = ? WHERE id = 1', (market_maker_inventory, market_maker_cash))
+
+            conn.commit()
+            conn.close()
+
+            return {
+                "message": f"{buyer} buys {num_shares} shares from the market maker at ${ask_price:.2f} each.",
+                "total_cost": total_cost,
+                "market_maker_inventory": market_maker_inventory,
+                "market_maker_cash": market_maker_cash,
+                "current_share_price": cur_value
+            }
+        else:
+            conn.close()
+            return {"message": f"Transaction failed. Either the market maker doesn't have enough shares or {buyer} doesn't have enough money."}
+
+    elif seller:
+        # Fetch seller data
         cursor.execute('SELECT shares, money FROM people_to_shares WHERE name = ?', (seller,))
         seller_data = cursor.fetchone()
         if not seller_data:
-            raise HTTPException(status_code=404, detail="Seller not found")
+            conn.close()
+            raise HTTPException(status_code=404, detail="Seller not found.")
 
-        seller_shares = seller_data[0]
-        seller_money = seller_data[1]
+        seller_shares, seller_money = seller_data
 
-    # Define the spread
-    bid_price = cur_value * 0.95  # The price the market maker is willing to pay (slightly lower)
-    ask_price = cur_value * 1.05  # The price the market maker is willing to sell (slightly higher)
+        total_income = num_shares * bid_price
+        if seller_shares >= num_shares:
+            # Update seller
+            seller_shares -= num_shares
+            seller_money += total_income
+            cursor.execute('UPDATE people_to_shares SET shares = ?, money = ? WHERE name = ?', (seller_shares, seller_money, seller))
 
-    # Simulate a buy order (buyer buys from the market maker)
-    if buyer:
-        total_cost = 0
-        for i in range(num_shares):
-            if market_maker_inventory > 0 and buyer_money >= ask_price:
-                total_cost += ask_price
-                market_maker_inventory -= 1
-                buyer_shares += 1
-                market_maker_cash += ask_price
-                buyer_money -= ask_price
-            else:
-                return {"message": f"{buyer} doesn't have enough money to buy more shares.", "shares_bought": i}
+            # Update market maker
+            market_maker_inventory += num_shares
+            market_maker_cash -= total_income
+            cursor.execute('UPDATE market_maker SET inventory = ?, cash = ? WHERE id = 1', (market_maker_inventory, market_maker_cash))
 
-        cursor.execute('UPDATE people_to_shares SET shares = ?, money = ? WHERE name = ?', (buyer_shares, buyer_money, buyer))
-        cursor.execute('UPDATE market_maker SET inventory = ?, cash = ? WHERE id = 1', (market_maker_inventory, market_maker_cash))
+            conn.commit()
+            conn.close()
 
-        return {
-            "message": f"{buyer} buys {num_shares} shares from the market maker at an average price of {ask_price:.2f} each.",
-            "market_maker_inventory": market_maker_inventory,
-            "market_maker_cash": market_maker_cash,
-            "current_share_price": cur_value
-        }
+            return {
+                "message": f"{seller} sells {num_shares} shares to the market maker at ${bid_price:.2f} each.",
+                "total_income": total_income,
+                "market_maker_inventory": market_maker_inventory,
+                "market_maker_cash": market_maker_cash,
+                "current_share_price": cur_value
+            }
+        else:
+            conn.close()
+            return {"message": f"Transaction failed. {seller} doesn't have enough shares to sell."}
 
-    # Simulate a sell order (seller sells to the market maker)
-    if seller:
-        total_income = 0
-        for i in range(num_shares):
-            if seller_shares > 0:
-                total_income += bid_price
-                seller_shares -= 1
-                market_maker_inventory += 1
-                market_maker_cash -= bid_price
-                seller_money += bid_price
-            else:
-                return {"message": f"{seller} doesn't have enough shares to sell.", "shares_sold": i}
+    else:
+        conn.close()
+        raise HTTPException(status_code=400, detail="You must specify either a buyer or a seller.")
 
-        cursor.execute('UPDATE people_to_shares SET shares = ?, money = ? WHERE name = ?', (seller_shares, seller_money, seller))
-        cursor.execute('UPDATE market_maker SET inventory = ?, cash = ? WHERE id = 1', (market_maker_inventory, market_maker_cash))
-
-        return {
-            "message": f"{seller} sells {num_shares} shares to the market maker at an average price of {bid_price:.2f} each.",
-            "market_maker_inventory": market_maker_inventory,
-            "market_maker_cash": market_maker_cash,
-            "current_share_price": cur_value
-        }
-
-    conn.commit()
-    conn.close()
 
 # Initialize the database when starting the server
 @app.on_event("startup")
